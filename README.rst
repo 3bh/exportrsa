@@ -8,10 +8,10 @@ https://www.nccgroup.trust/globalassets/our-research/uk/whitepapers/exporting_no
 
 by Jason Geffner <jason.geffner@ngssecure.com> that can be found in the doc folder
 
-The repo contains a Visual Studio 2022 buildable project. The repo contains a Debug and Release build versions. Executable are in:
-
-DEBUG:   https://github.com/luipir/ExportNotExportablePrivateKey/blob/master/exportrsa/Debug/exportrsa.exe
-RELEASE: https://github.com/luipir/ExportNotExportablePrivateKey/blob/master/exportrsa/Release/exportrsa.exe
+The repo contains a Visual Studio 2022 buildable project. Build it yourself as
+described in the `Building`_ section below; no prebuilt executables are
+committed. The Release binary links the C runtime statically, so the resulting
+exportrsa.exe is a single self-contained file.
 
 How to use
 ~~~~~~~~~~
@@ -22,6 +22,7 @@ Just run exportrsa.exe in a command shell::
 
     exportrsa.exe [-verbose] [--include-cng] [--include-expired]
                   [--no-password] [--password-file <path>] [--non-interactive]
+                  [-h]
 
 For every certificate it is about to export the tool prints the certificate
 name together with the whole chain up to the root, showing for each link its
@@ -56,7 +57,7 @@ certificates would map to the same file name a numeric suffix is added.
 Switches
 ~~~~~~~~
 
-``-verbose``
+``-verbose`` (also ``--verbose``)
     Print diagnostics about certificates that are skipped because they have no
     associated (RSA) private key. These messages are suppressed by default.
 
@@ -73,7 +74,7 @@ Switches
     Do not prompt for a password; export the PFX files with an empty password.
     By default you are prompted (twice) for a password to protect each export.
 
-``--password-file <path>``
+``--password-file <path>`` (or ``--password-file=<path>``)
     Read the export password from the first line of ``<path>`` (a trailing
     CR/LF is stripped) instead of prompting. Takes precedence over the other
     password options.
@@ -84,17 +85,22 @@ Switches
     is given; if nothing is piped in, the password is empty. Combine with
     ``--include-cng`` / ``--include-expired`` to dump those as well.
 
+``-h`` (also ``--help`` or ``/?``)
+    Print a short usage summary and exit without exporting anything.
+
 Building
 ~~~~~~~~
 
-Open ``exportrsa/exportrsa.sln`` in Visual Studio 2022 (with the "Desktop
-development with C++" workload and a Windows 10/11 SDK), or build from a command
-shell::
+Open ``exportrsa/exportrsa.sln`` in Visual Studio 2022 with the "Desktop
+development with C++" workload (which supplies the v143 toolset) and a
+Windows 10/11 SDK, then build the Release / Win32 configuration.
+
+To build from a Developer Command Prompt for VS 2022 instead::
 
     msbuild exportrsa\exportrsa.sln /p:Configuration=Release /p:Platform=Win32
 
 The project targets the v143 toolset and builds as a 32-bit (Win32) application.
-
-At runtime you may get an error about a missing Visual C++ runtime DLL (for
-example VCRUNTIME140.dll). Install the Visual C++ Redistributable for Visual
-Studio 2015-2022 (x86): https://aka.ms/vs/17/release/vc_redist.x86.exe
+Both configurations link the C runtime statically (``/MT`` for Release, ``/MTd``
+for Debug), so the built exportrsa.exe runs on a clean Windows machine with no
+Visual C++ redistributable installed. Copy the exe on its own to the target
+machine; it needs no accompanying runtime DLLs.
