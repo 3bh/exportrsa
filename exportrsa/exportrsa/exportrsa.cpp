@@ -53,6 +53,8 @@ March 18, 2011 - v1.0 - First public release
 
 #include <iostream>
 #include <string>
+#include <set>
+#include <fstream>
 
 #include <Windows.h>
 #include <WinCrypt.h>
@@ -69,8 +71,239 @@ using namespace std;
 #define CERT_NCRYPT_KEY_SPEC 0xFFFFFFFF
 #endif
 
-unsigned long g_ulFileNumber;
 BOOL g_fWow64Process;
+BOOL g_fVerbose = FALSE;
+BOOL g_fIncludeCng = FALSE;
+BOOL g_fIncludeExpired = FALSE;
+BOOL g_fNoPassword = FALSE;
+BOOL g_fNonInteractive = FALSE;
+BOOL g_fPasswordFromFile = FALSE;
+wstring g_passwordFilePath;
+wstring g_password;   // password used to protect every export (collected once)
+set<wstring> g_exportedThumbprints;   // SHA1 thumbprints already exported
+
+// Widen a byte string to a wstring the same way getpass() does (one byte per
+// wchar_t), so a password read from a file or stdin matches a typed one.
+wstring
+WidenBytes(const string& s)
+{
+    wstring w;
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        w += (wchar_t)(unsigned char)s[i];
+    }
+    return w;
+}
+
+// Read the password from the first line of a file. Returns false if the file
+// cannot be opened.
+bool
+ReadPasswordFromFile(const wstring& path, wstring& out)
+{
+    ifstream f(path.c_str(), ios::binary);
+    if (!f.is_open())
+    {
+        return false;
+    }
+    string line;
+    getline(f, line);   // first line, up to the newline
+    if (!line.empty() && line[line.size() - 1] == '\r')
+    {
+        line.resize(line.size() - 1);
+    }
+    out = WidenBytes(line);
+    return true;
+}
+
+// Format a FILETIME as "YYYY-MM-DD HH:MM:SS" (UTC).
+wstring
+FileTimeToString(const FILETIME& ft)
+{
+    SYSTEMTIME st;
+    wchar_t buf[64];
+    if (FileTimeToSystemTime(&ft, &st))
+    {
+        swprintf_s(buf,
+                   L"%04d-%02d-%02d %02d:%02d:%02d",
+                   st.wYear, st.wMonth, st.wDay,
+                   st.wHour, st.wMinute, st.wSecond);
+        return wstring(buf);
+    }
+    return wstring(L"<invalid date>");
+}
+
+// Format a FILETIME as just "YYYY-MM-DD" (UTC), safe for use in a file name.
+wstring
+FileTimeToDateString(const FILETIME& ft)
+{
+    SYSTEMTIME st;
+    wchar_t buf[16];
+    if (FileTimeToSystemTime(&ft, &st))
+    {
+        swprintf_s(buf,
+                   L"%04d-%02d-%02d",
+                   st.wYear, st.wMonth, st.wDay);
+        return wstring(buf);
+    }
+    return wstring(L"unknown-date");
+}
+
+// Retrieve a certificate's simple display name (subject, or issuer when
+// CERT_NAME_ISSUER_FLAG is passed).
+wstring
+GetCertDisplayName(PCCERT_CONTEXT pCtx, DWORD dwFlags)
+{
+    DWORD cch = CertGetNameStringW(
+                pCtx,
+                CERT_NAME_SIMPLE_DISPLAY_TYPE,
+                dwFlags,
+                NULL,
+                NULL,
+                0);
+    if (cch <= 1)
+    {
+        return wstring(L"");
+    }
+    wchar_t* buf = (wchar_t*)malloc(cch * sizeof(wchar_t));
+    CertGetNameStringW(
+                pCtx,
+                CERT_NAME_SIMPLE_DISPLAY_TYPE,
+                dwFlags,
+                NULL,
+                buf,
+                cch);
+    wstring s(buf);
+    free(buf);
+    return s;
+}
+
+// Turn an arbitrary certificate name into something safe to use as a file name.
+wstring
+SanitizeFileName(const wstring& in)
+{
+    wstring out;
+    for (size_t i = 0; i < in.size(); ++i)
+    {
+        wchar_t c = in[i];
+        if ((c >= L'0' && c <= L'9') ||
+            (c >= L'A' && c <= L'Z') ||
+            (c >= L'a' && c <= L'z') ||
+            c == L'-' || c == L'.')
+        {
+            out += c;
+        }
+        else
+        {
+            // spaces and everything else become a single underscore
+            out += L'_';
+        }
+    }
+    // trim leading/trailing separators
+    while (!out.empty() &&
+           (out[out.size() - 1] == L'_' || out[out.size() - 1] == L'.'))
+    {
+        out.resize(out.size() - 1);
+    }
+    size_t start = 0;
+    while (start < out.size() && out[start] == L'_')
+    {
+        start++;
+    }
+    out = out.substr(start);
+    if (out.size() > 80)
+    {
+        out = out.substr(0, 80);
+    }
+    if (out.empty())
+    {
+        out = L"cert";
+    }
+    return out;
+}
+
+// Return the certificate's SHA1 thumbprint as an uppercase hex string, or an
+// empty string if it cannot be determined.
+wstring
+GetCertThumbprint(PCCERT_CONTEXT pCtx)
+{
+    BYTE rgbHash[64];
+    DWORD cbHash = sizeof(rgbHash);
+    if (!CertGetCertificateContextProperty(pCtx, CERT_HASH_PROP_ID, rgbHash, &cbHash))
+    {
+        return wstring(L"");
+    }
+    wstring hex;
+    wchar_t byteHex[3];
+    for (DWORD i = 0; i < cbHash; ++i)
+    {
+        swprintf_s(byteHex, L"%02X", rgbHash[i]);
+        hex += byteHex;
+    }
+    return hex;
+}
+
+// Print the certificate name plus, for the whole chain up to the root, each
+// certificate's subject, issue date, expiration date and issuing certificate.
+void
+PrintCertChainInfo(PCCERT_CONTEXT pCertContext)
+{
+    CERT_CHAIN_PARA chainPara;
+    memset(&chainPara, 0, sizeof(chainPara));
+    chainPara.cbSize = sizeof(chainPara);
+
+    PCCERT_CHAIN_CONTEXT pChainContext = NULL;
+    if (CertGetCertificateChain(
+                NULL,
+                pCertContext,
+                NULL,
+                pCertContext->hCertStore,
+                &chainPara,
+                0,
+                NULL,
+                &pChainContext)
+        && pChainContext->cChain > 0)
+    {
+        PCERT_SIMPLE_CHAIN pChain = pChainContext->rgpChain[0];
+        for (DWORD i = 0; i < pChain->cElement; ++i)
+        {
+            PCCERT_CONTEXT pElem = pChain->rgpElement[i]->pCertContext;
+            wstring subj   = GetCertDisplayName(pElem, 0);
+            wstring issuer = GetCertDisplayName(pElem, CERT_NAME_ISSUER_FLAG);
+            // A self-signed (root) certificate is its own issuer.
+            if (issuer == subj)
+            {
+                issuer = L"<self>";
+            }
+            wstring nb     = FileTimeToString(pElem->pCertInfo->NotBefore);
+            wstring na     = FileTimeToString(pElem->pCertInfo->NotAfter);
+            fprintf(stdout,
+                    "    [%u] %S\n"
+                    "        Issued : %S\n"
+                    "        Expires: %S\n"
+                    "        Issuer : %S\n",
+                    i, subj.c_str(), nb.c_str(), na.c_str(), issuer.c_str());
+        }
+        CertFreeCertificateChain(pChainContext);
+    }
+    else
+    {
+        // Could not build a chain; report just this certificate.
+        wstring subj   = GetCertDisplayName(pCertContext, 0);
+        wstring issuer = GetCertDisplayName(pCertContext, CERT_NAME_ISSUER_FLAG);
+        if (issuer == subj)
+        {
+            issuer = L"<self>";
+        }
+        wstring nb     = FileTimeToString(pCertContext->pCertInfo->NotBefore);
+        wstring na     = FileTimeToString(pCertContext->pCertInfo->NotAfter);
+        fprintf(stdout,
+                "    %S\n"
+                "        Issued : %S\n"
+                "        Expires: %S\n"
+                "        Issuer : %S\n",
+                subj.c_str(), nb.c_str(), na.c_str(), issuer.c_str());
+    }
+}
 
 wstring
 getpass(
@@ -112,7 +345,48 @@ getpass(
 		}
 	}
 	cout <<endl;
+	// Restore the original console mode so later line-oriented input
+	// behaves normally.
+	SetConsoleMode( hIn, con_mode );
 	return password;
+}
+
+// Read a line from the console with normal echo/line editing, independent of
+// whatever mode the console was previously left in. Returns the text without
+// the trailing CR/LF. Used for interactive Y/n prompts.
+string
+ReadConsoleLine()
+{
+	HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+	DWORD oldMode = 0;
+	BOOL haveMode = GetConsoleMode(hIn, &oldMode);
+	if (haveMode)
+	{
+		// Force cooked mode so Enter terminates the read and typing echoes.
+		SetConsoleMode(hIn,
+			oldMode | ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+	}
+
+	string line;
+	char ch = 0;
+	DWORD dwRead = 0;
+	while (ReadConsoleA(hIn, &ch, 1, &dwRead, NULL) && dwRead == 1)
+	{
+		if (ch == '\n')
+		{
+			break;
+		}
+		if (ch != '\r')
+		{
+			line += ch;
+		}
+	}
+
+	if (haveMode)
+	{
+		SetConsoleMode(hIn, oldMode);
+	}
+	return line;
 }
 
 BOOL WINAPI
@@ -177,7 +451,10 @@ CertEnumSystemStoreCallback(
                     szOID_RSA,
                     strlen(szOID_RSA)))
         {
-            fprintf(stderr, "Skip cert with NO rsa public key for %S\n", dwCertName);
+            if (g_fVerbose)
+            {
+                fprintf(stderr, "Skip cert with NO rsa public key for %S\n", dwCertName);
+            }
             continue;
         }
 
@@ -190,7 +467,10 @@ CertEnumSystemStoreCallback(
                     &dwKeySpec,
                     &dwKeySpecSize))
         {
-            //fprintf(stderr, "Skip cert with NO private key for %S: %x\n", dwCertName, GetLastError());
+            if (g_fVerbose)
+            {
+                fprintf(stderr, "Skip cert with NO private key for %S: %x\n", dwCertName, GetLastError());
+            }
             continue;
         }
 
@@ -217,8 +497,55 @@ CertEnumSystemStoreCallback(
                     &dwKeySpec,
                     &fCallerFreeProvOrNCryptKey))
         {
-            fprintf(stderr, "Skip cert with NO private key handler for %S: %x\n", dwCertName, GetLastError());
+            if (g_fVerbose)
+            {
+                fprintf(stderr, "Skip cert with NO private key handler for %S: %x\n", dwCertName, GetLastError());
+            }
             continue;
+        }
+
+        // Skip CNG keys unless the caller explicitly opted in with --include-cng
+        if (CERT_NCRYPT_KEY_SPEC == dwKeySpec && !g_fIncludeCng)
+        {
+            fprintf(stdout, "Not exporting CNG key for \"%S\" (pass --include-cng to include it)\n\n", dwCertName);
+            continue;
+        }
+
+        // Skip expired certificates unless --include-expired was passed.
+        if (CertVerifyTimeValidity(NULL, pCertContext->pCertInfo) > 0 && !g_fIncludeExpired)
+        {
+            fprintf(stdout, "Not exporting EXPIRED cert \"%S\" (pass --include-expired to include it)\n\n", dwCertName);
+            continue;
+        }
+
+        // The same certificate can live in more than one store (e.g. user and
+        // machine). Skip any we've already exported this run.
+        wstring thumbprint = GetCertThumbprint(pCertContext);
+        if (!thumbprint.empty() && g_exportedThumbprints.count(thumbprint) != 0)
+        {
+            fprintf(stdout, "Skipping duplicate of \"%S\" (already exported, thumbprint %S)\n\n", dwCertName, thumbprint.c_str());
+            continue;
+        }
+
+        // List the certificate, including issue/expiration dates and the
+        // issuing certificate for the whole chain, then ask whether to export
+        // it (default Yes: just press Enter to accept).
+        fprintf(stdout, "Certificate to export: \"%S\"\n", dwCertName);
+        PrintCertChainInfo(pCertContext);
+
+        // Ask whether to export, unless running non-interactively.
+        if (!g_fNonInteractive)
+        {
+            fprintf(stdout, "Export this certificate? [Y|n] (default Y) >>>> ");
+            fflush(stdout);
+            string answer = ReadConsoleLine();
+            size_t nonBlank = answer.find_first_not_of(" \t\r\n");
+            if (nonBlank != string::npos &&
+                (answer[nonBlank] == 'n' || answer[nonBlank] == 'N'))
+            {
+                fprintf(stdout, "Cert \"%S\" will be NOT exported\n\n", dwCertName);
+                continue;
+            }
         }
 
         // do the job
@@ -240,7 +567,10 @@ CertEnumSystemStoreCallback(
                         dwKeySpec,
                         &hKey))
             {
-                fprintf(stderr, "Cannot retrieve handle to the private key for %S\n", dwCertName);
+                if (g_fVerbose)
+                {
+                    fprintf(stderr, "Cannot retrieve handle to the private key for %S\n", dwCertName);
+                }
                 continue;
             }
 
@@ -253,20 +583,9 @@ CertEnumSystemStoreCallback(
                       NULL,
                       &cbData))
             {
-                fprintf(stderr, "Private key for cert \"%S\" is not exportable: %x\n", dwCertName, GetLastError() );
-
-                // Ask permission to the user to export cert
-                fprintf(stdout, "Do you really want to export Public/private key for cert \"%S\"\n[Y|N] (default N) >>>> ", dwCertName );
-                char response = ' ';
-                cin.clear();
-                cin.sync();
-                cin.get(response);
-                cin.clear();
-                cin.sync();
-                if ( response != 'Y' )
+                if (g_fVerbose)
                 {
-                    fprintf(stdout, "Cert \"%S\" will be NOT exported\n\n", dwCertName );
-                    continue;
+                    fprintf(stderr, "Private key for cert \"%S\" is not exportable, forcing export: %x\n", dwCertName, GetLastError() );
                 }
 
                 // Mark the certificate's private key as exportable and archivable
@@ -456,14 +775,7 @@ CertEnumSystemStoreCallback(
         }
 #endif
 
-        // ask for pwd to encrypt exported private key
-        wstring password  = getpass("Enter password to protect exported cert: ",true); // Show asterisks
-        wstring passwordCheck = getpass("Enter password again: ",true); // Show asterisks
-        if( password != passwordCheck )
-        {
-            fprintf(stderr, "Password mismatch, SKIP exporting\n\n" );
-            continue;
-        }
+        // Use the password collected once at startup (empty when --no-password).
 
         // Create a temporary certificate store in memory
         HCERTSTORE hMemoryStore = CertOpenStore(
@@ -505,7 +817,7 @@ CertEnumSystemStoreCallback(
         PFXExportCertStoreEx(
                     hMemoryStore,
                     &cdb,
-                    password.c_str(),
+                    g_password.c_str(),
                     NULL,
                     EXPORT_PRIVATE_KEYS | REPORT_NO_PRIVATE_KEY
                     | REPORT_NOT_ABLE_TO_EXPORT_PRIVATE_KEY);
@@ -514,16 +826,31 @@ CertEnumSystemStoreCallback(
         PFXExportCertStoreEx(
                     hMemoryStore,
                     &cdb,
-                    password.c_str(),
+                    g_password.c_str(),
                     NULL,
                     EXPORT_PRIVATE_KEYS | REPORT_NO_PRIVATE_KEY
                     | REPORT_NOT_ABLE_TO_EXPORT_PRIVATE_KEY);
 
-        // Prepare the PFX's file name
+        // Prepare the PFX's file name from the issuer's name, the certificate's
+        // name and the certificate's issue date, made safe for use as a file name.
+        wstring issuerName  = GetCertDisplayName(pCertContext, CERT_NAME_ISSUER_FLAG);
+        wstring subjectName = GetCertDisplayName(pCertContext, 0);
+        wstring issueDate   = FileTimeToDateString(pCertContext->pCertInfo->NotBefore);
+        wstring baseName    = issueDate + L"_" +
+                              SanitizeFileName(issuerName) + L"_" +
+                              SanitizeFileName(subjectName);
+
+        // Avoid clobbering an existing file (e.g. duplicate issuer/subject/date
+        // triples). Probe per-name so the suffixes for a given name run 1, 2, 3,
+        // ... with no gaps, independent of other certificates' file names.
         wchar_t wszFileName[MAX_PATH];
-        swprintf(   wszFileName,
-                    L"%d.pfx",
-                    g_ulFileNumber++);
+        swprintf_s(wszFileName, L"%s.pfx", baseName.c_str());
+        for (unsigned long dup = 1;
+             INVALID_FILE_ATTRIBUTES != GetFileAttributesW(wszFileName);
+             ++dup)
+        {
+            swprintf_s(wszFileName, L"%s_%lu.pfx", baseName.c_str(), dup);
+        }
 
         // Write the PFX data blob to disk
         HANDLE hFile = CreateFile(
@@ -542,6 +869,12 @@ CertEnumSystemStoreCallback(
                     &dwBytesWritten,
                     NULL);
         CloseHandle(hFile);
+
+        // Remember this cert so we don't export it again from another store.
+        if (!thumbprint.empty())
+        {
+            g_exportedThumbprints.insert(thumbprint);
+        }
 
 		fprintf(stdout, "SUCCESSFULLY exported cert bundle for \"%S\"in file \"%S\" \n\n", dwCertName, wszFileName );
     }
@@ -567,8 +900,108 @@ CertEnumSystemStoreLocationCallback(
 
 int _tmain(int argc, _TCHAR* argv[])
 {
-    // Initialize g_ulFileNumber
-    g_ulFileNumber = 1;
+    // Parse command-line switches
+    for (int i = 1; i < argc; ++i)
+    {
+        if (0 == _wcsicmp(argv[i], L"-verbose") ||
+            0 == _wcsicmp(argv[i], L"--verbose"))
+        {
+            g_fVerbose = TRUE;
+        }
+        else if (0 == _wcsicmp(argv[i], L"--include-cng"))
+        {
+            g_fIncludeCng = TRUE;
+        }
+        else if (0 == _wcsicmp(argv[i], L"--include-expired"))
+        {
+            g_fIncludeExpired = TRUE;
+        }
+        else if (0 == _wcsicmp(argv[i], L"--no-password"))
+        {
+            g_fNoPassword = TRUE;
+        }
+        else if (0 == _wcsnicmp(argv[i], L"--password-file=", 16))
+        {
+            g_fPasswordFromFile = TRUE;
+            g_passwordFilePath = argv[i] + 16;
+        }
+        else if (0 == _wcsicmp(argv[i], L"--password-file"))
+        {
+            if (i + 1 < argc)
+            {
+                g_fPasswordFromFile = TRUE;
+                g_passwordFilePath = argv[++i];
+            }
+            else
+            {
+                fprintf(stderr, "--password-file requires a path argument\n");
+                return 1;
+            }
+        }
+        else if (0 == _wcsicmp(argv[i], L"--non-interactive"))
+        {
+            g_fNonInteractive = TRUE;
+        }
+        else if (0 == _wcsicmp(argv[i], L"-h") ||
+                 0 == _wcsicmp(argv[i], L"--help") ||
+                 0 == _wcsicmp(argv[i], L"/?"))
+        {
+            fprintf(stdout,
+                    "Usage: exportrsa.exe [-verbose] [--include-cng] [--include-expired]\n"
+                    "                     [--no-password] [--password-file <path>] [--non-interactive]\n"
+                    "  -verbose             Print diagnostics about skipped certificates.\n"
+                    "  --include-cng        Also export CNG (KeyIso) private keys.\n"
+                    "  --include-expired    Also export certificates that have expired.\n"
+                    "  --no-password        Do not use a password; export with an empty one.\n"
+                    "  --password-file <p>  Read the export password from the first line of file <p>.\n"
+                    "  --non-interactive    Export everything without prompting. Reads the password\n"
+                    "                       from stdin unless --no-password or --password-file is given.\n");
+            return 0;
+        }
+        else
+        {
+            fprintf(stderr, "Unknown argument: %S\n", argv[i]);
+        }
+    }
+
+    // Determine the export password once, up front. Precedence:
+    //   --password-file  > --no-password > --non-interactive (stdin) > prompt
+    if (g_fPasswordFromFile)
+    {
+        if (!ReadPasswordFromFile(g_passwordFilePath, g_password))
+        {
+            fprintf(stderr, "Cannot open password file \"%S\", aborting.\n", g_passwordFilePath.c_str());
+            return 1;
+        }
+    }
+    else if (g_fNoPassword)
+    {
+        g_password = L"";
+    }
+    else if (g_fNonInteractive)
+    {
+        // Read the password from the first line of stdin (allows piping it in).
+        string line;
+        getline(cin, line);
+        if (!line.empty() && line[line.size() - 1] == '\r')
+        {
+            line.resize(line.size() - 1);
+        }
+        g_password = WidenBytes(line);
+    }
+    else
+    {
+        g_password = getpass("Enter password to protect exported certs: ", true);
+        wstring passwordCheck = getpass("Enter password again: ", true);
+        if (g_password != passwordCheck)
+        {
+            fprintf(stderr, "Password mismatch, aborting.\n");
+            return 1;
+        }
+        // Separate the password prompts from the certificate output below.
+        fprintf(stdout, "\n");
+    }
+
     // Determine if we're a 32-bit process running on a 64-bit OS
     g_fWow64Process = FALSE;
     BOOL (WINAPI* IsWow64Process)(HANDLE, PBOOL) =
